@@ -1,0 +1,201 @@
+// File: src/main/java/com/api/PostmanCLIGenerator.java
+package com.api;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.oas.models.PathItem;
+import io.swagger.v3.oas.models.media.*;
+import io.swagger.v3.oas.models.parameters.Parameter;
+import io.swagger.v3.oas.models.Operation;
+import io.swagger.v3.parser.OpenAPIV3Parser;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.util.*;
+
+public class PostmanCLIGenerator {
+
+    static class PostmanCollection {
+        public Info info = new Info();
+        public List<Item> item = new ArrayList<>();
+    }
+
+    static class Info {
+        public String name = "Generated Collection";
+        public String schema = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json";
+    }
+
+    static class Item {
+        public String name;
+        public Request request = new Request();
+        public List<Event> event = new ArrayList<>();
+    }
+
+    static class Request {
+        public String method;
+        public Url url = new Url();
+        public Body body = new Body();
+    }
+
+    static class Url {
+        public String raw;
+        public List<String> path = new ArrayList<>();
+        public List<Query> query = new ArrayList<>();
+    }
+
+    static class Query {
+        public String key;
+        public String value;
+    }
+
+    static class Body {
+        public String mode = "raw";
+        public String raw;
+    }
+
+    static class Event {
+        public String listen = "test";
+        public Script script = new Script();
+    }
+
+    static class Script {
+        public String type = "text/javascript";
+        public List<String> exec = new ArrayList<>();
+    }
+
+    public static void main(String[] args) {
+        if (args.length != 1) {
+            System.out.println("Usage: java -jar postman-cli-generator.jar <path-to-openapi.yaml>");
+            return;
+        }
+
+        String filePath = args[0];
+        OpenAPI openAPI = new OpenAPIV3Parser().read(filePath);
+        PostmanCollection collection = new PostmanCollection();
+
+        Map<String, String> outputVariableMap = new HashMap<>();
+
+        openAPI.getPaths().forEach((path, pathItem) -> {
+            for (PathItem.HttpMethod method : pathItem.readOperationsMap().keySet()) {
+                Operation operation = pathItem.readOperationsMap().get(method);
+                Item item = new Item();
+                item.name = operation.getSummary() != null ? operation.getSummary() : path;
+                item.request.method = method.name();
+                item.request.url.raw = "http://localhost:8080" + path;
+
+                for (String segment : path.split("/")) {
+                    if (!segment.isEmpty()) item.request.url.path.add(segment);
+                }
+
+                if (operation.getParameters() != null) {
+                    for (Parameter parameter : operation.getParameters()) {
+                        Query q = new Query();
+                        q.key = parameter.getName();
+                        q.value = "{{" + parameter.getName() + "}}";
+                        item.request.url.query.add(q);
+                    }
+                }
+
+                RequestBody requestBody = operation.getRequestBody();
+                if (requestBody != null && requestBody.getContent() != null) {
+                    Content content = requestBody.getContent();
+                    MediaType mediaType = content.get("application/json");
+                    if (mediaType != null && mediaType.getSchema() != null) {
+                        String bodyStr = generateSampleJson(mediaType.getSchema(), openAPI.getComponents().getSchemas(), outputVariableMap);
+                        item.request.body.raw = bodyStr;
+                    }
+                }
+
+                // Extract response fields and save as potential chaining variables
+                if (operation.getResponses() != null && operation.getResponses().get("200") != null) {
+                    Content content = operation.getResponses().get("200").getContent();
+                    if (content != null && content.get("application/json") != null) {
+                        Schema<?> respSchema = content.get("application/json").getSchema();
+                        Map<String, String> outputVars = extractResponseVariables(respSchema, openAPI.getComponents().getSchemas(), "");
+                        outputVariableMap.putAll(outputVars);
+
+                        // Generate Postman test scripts to extract variables
+                        Event event = new Event();
+                        for (Map.Entry<String, String> entry : outputVars.entrySet()) {
+                            event.script.exec.add("pm.collectionVariables.set(\"" + entry.getKey() + "\", " + generateJsonPathAccess(entry.getValue()) + ");");
+                        }
+                        item.event.add(event);
+                    }
+                }
+
+                collection.item.add(item);
+            }
+        });
+
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            FileWriter writer = new FileWriter(new File("generated_postman_collection.json"));
+            mapper.writerWithDefaultPrettyPrinter().writeValue(writer, collection);
+            System.out.println("\u2705 Postman collection saved to generated_postman_collection.json");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static String generateSampleJson(Schema<?> schema, Map<String, Schema> allSchemas, Map<String, String> outputVariableMap) {
+        if (schema.get$ref() != null) {
+            String ref = schema.get$ref().replace("#/components/schemas/", "");
+            schema = allSchemas.get(ref);
+        }
+
+        Map<String, Object> sample = new LinkedHashMap<>();
+        if (schema.getProperties() != null) {
+            for (Object key : schema.getProperties().keySet()) {
+                String k = key.toString();
+                Schema<?> propSchema = (Schema<?>) schema.getProperties().get(k);
+                if (propSchema.get$ref() != null || "object".equals(propSchema.getType())) {
+                    String nestedJson = generateSampleJson(propSchema, allSchemas, outputVariableMap);
+                    sample.put(k, new ObjectMapper().readValue(nestedJson, Map.class));
+                } else if (outputVariableMap.containsKey(k)) {
+                    sample.put(k, "{{" + k + "}}");
+                } else {
+                    sample.put(k, "sample_value");
+                }
+            }
+        }
+
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(sample);
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
+    private static Map<String, String> extractResponseVariables(Schema<?> schema, Map<String, Schema> allSchemas, String parentPath) {
+        Map<String, String> responseMap = new HashMap<>();
+        if (schema.get$ref() != null) {
+            String ref = schema.get$ref().replace("#/components/schemas/", "");
+            schema = allSchemas.get(ref);
+        }
+
+        if (schema.getProperties() != null) {
+            for (Object key : schema.getProperties().keySet()) {
+                String k = key.toString();
+                Schema<?> propSchema = (Schema<?>) schema.getProperties().get(k);
+                String fullPath = parentPath.isEmpty() ? k : parentPath + "." + k;
+
+                if (propSchema.get$ref() != null || "object".equals(propSchema.getType())) {
+                    responseMap.putAll(extractResponseVariables(propSchema, allSchemas, fullPath));
+                } else {
+                    responseMap.put(fullPath, fullPath);
+                }
+            }
+        }
+        return responseMap;
+    }
+
+    private static String generateJsonPathAccess(String nestedPath) {
+        String[] parts = nestedPath.split("\\.");
+        StringBuilder builder = new StringBuilder("pm.response.json()");
+        for (String part : parts) {
+            builder.append("[\"").append(part).append("\"]");
+        }
+        return builder.toString();
+    }
+}
