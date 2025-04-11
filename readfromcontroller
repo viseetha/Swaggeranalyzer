@@ -1,0 +1,180 @@
+// File: src/main/java/com/api/PostmanCLIGenerator.java
+package com.api;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.NormalAnnotationExpr;
+import com.github.javaparser.ast.expr.MemberValuePair;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
+
+import java.io.*;
+import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
+
+public class PostmanCLIGenerator {
+
+    static class PostmanCollection {
+        public Info info = new Info();
+        public List<Item> item = new ArrayList<>();
+        public Auth auth = new Auth();
+    }
+
+    static class Info {
+        public String name = "Generated Collection";
+        public String schema = "https://schema.getpostman.com/json/collection/v2.1.0/collection.json";
+    }
+
+    static class Auth {
+        public String type = "bearer";
+        public List<AuthParam> bearer = List.of(new AuthParam());
+    }
+
+    static class AuthParam {
+        public String key = "token";
+        public String value = "{{bearer_token}}";
+        public String type = "string";
+    }
+
+    static class Item {
+        public String name;
+        public Request request = new Request();
+        public List<Event> event = new ArrayList<>();
+    }
+
+    static class Request {
+        public String method;
+        public Url url = new Url();
+        public Body body = new Body();
+        public List<Header> header = List.of(new Header());
+    }
+
+    static class Url {
+        public String raw;
+        public List<String> path = new ArrayList<>();
+        public List<Query> query = new ArrayList<>();
+    }
+
+    static class Query {
+        public String key;
+        public String value;
+    }
+
+    static class Header {
+        public String key = "Authorization";
+        public String value = "Bearer {{bearer_token}}";
+        public String type = "text";
+    }
+
+    static class Body {
+        public String mode = "raw";
+        public String raw;
+    }
+
+    static class Event {
+        public String listen = "test";
+        public Script script = new Script();
+    }
+
+    static class Script {
+        public String type = "text/javascript";
+        public List<String> exec = new ArrayList<>();
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length != 1) {
+            System.out.println("Usage: java -jar postman-cli-generator.jar <path-to-java-controller-folder>");
+            return;
+        }
+
+        File folder = new File(args[0]);
+        PostmanCollection collection = new PostmanCollection();
+
+        for (File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.endsWith(".java")))) {
+            CompilationUnit cu = JavaParser.parse(file);
+            Optional<ClassOrInterfaceDeclaration> controllerClass = cu.getClassByName(file.getName().replace(".java", ""));
+
+            if (controllerClass.isPresent()) {
+                for (MethodDeclaration method : controllerClass.get().getMethods()) {
+                    Item item = new Item();
+                    String methodType = "POST";
+                    String path = "/" + method.getNameAsString();
+
+                    for (AnnotationExpr annotation : method.getAnnotations()) {
+                        if (annotation.getNameAsString().matches("GetMapping|PostMapping|PutMapping|DeleteMapping")) {
+                            methodType = annotation.getNameAsString().replace("Mapping", "").toUpperCase();
+                            if (annotation.isNormalAnnotationExpr()) {
+                                for (MemberValuePair pair : ((NormalAnnotationExpr) annotation).getPairs()) {
+                                    if (pair.getNameAsString().equals("value")) {
+                                        path = pair.getValue().toString().replaceAll("\"", "");
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    item.name = method.getNameAsString();
+                    item.request.method = methodType;
+                    item.request.url.raw = "http://localhost:8080" + path;
+                    Arrays.stream(path.split("/")).filter(s -> !s.isEmpty()).forEach(s -> item.request.url.path.add(s));
+
+                    StringBuilder requestBodyBuilder = new StringBuilder();
+                    requestBodyBuilder.append("{\n");
+                    for (Parameter param : method.getParameters()) {
+                        String paramType = param.getTypeAsString();
+                        try {
+                            Class<?> clazz = Class.forName(paramType);
+                            extractFieldsRecursively(clazz, requestBodyBuilder, "  ");
+                        } catch (Exception ignored) {}
+                    }
+                    requestBodyBuilder.append("}\n");
+                    item.request.body.raw = requestBodyBuilder.toString();
+
+                    Event event = new Event();
+                    event.script.exec.add("let response = pm.response.json();");
+                    event.script.exec.add("// Add custom nested/array chaining here");
+                    event.script.exec.add("for (let key in response) {");
+                    event.script.exec.add("    if (typeof response[key] === 'object') {");
+                    event.script.exec.add("        for (let sub in response[key]) {");
+                    event.script.exec.add("            pm.environment.set(key + '.' + sub, response[key][sub]);");
+                    event.script.exec.add("        }");
+                    event.script.exec.add("    } else {");
+                    event.script.exec.add("        pm.environment.set(key, response[key]);");
+                    event.script.exec.add("    }");
+                    event.script.exec.add("}");
+                    item.event.add(event);
+
+                    collection.item.add(item);
+                }
+            }
+        }
+
+        ObjectMapper mapper = new ObjectMapper();
+        FileWriter writer = new FileWriter(new File("generated_postman_collection.json"));
+        mapper.writerWithDefaultPrettyPrinter().writeValue(writer, collection);
+        System.out.println("\u2705 Postman collection saved to generated_postman_collection.json");
+    }
+
+    public static void extractFieldsRecursively(Class<?> clazz, StringBuilder builder, String indent) {
+        for (Field field : clazz.getDeclaredFields()) {
+            builder.append(indent).append("\"").append(field.getName()).append("\": ");
+            if (field.getType().isArray() || List.class.isAssignableFrom(field.getType())) {
+                builder.append("[\"value1\", \"value2\"],\n");
+            } else if (!field.getType().isPrimitive() && !field.getType().getName().startsWith("java")) {
+                builder.append("{\n");
+                try {
+                    extractFieldsRecursively(Class.forName(field.getType().getName()), builder, indent + "  ");
+                } catch (Exception ignored) {}
+                builder.append(indent).append("},\n");
+            } else {
+                builder.append("\"sample\",\n");
+            }
+        }
+    }
+}
